@@ -434,30 +434,51 @@ def get_gpu_free_memory():
         pass
     return 0
 
-def get_duration(input_file: Path) -> Optional[float]:
-    """Get video duration in seconds using ffprobe."""
+def get_media_info_json(input_file: Path) -> Dict:
+    """
+    Get both duration and codec info in one pass using ffprobe json output.
+    Returns dict with keys: 'duration' (float), 'codec' (str).
+    """
     cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(input_file)
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name:format=duration",
+        "-of", "json", str(input_file)
     ]
     try:
+        # Timeout slightly longer as we are checking more
         result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
-        return float(result.stdout.strip())
+        data = json.loads(result.stdout)
+        
+        info = {'duration': 0.0, 'codec': None}
+        
+        # Get duration (try format, then stream)
+        try:
+            if 'format' in data and 'duration' in data['format']:
+                info['duration'] = float(data['format']['duration'])
+        except Exception:
+            pass
+            
+        # Get codec
+        try:
+            if 'streams' in data and len(data['streams']) > 0:
+                info['codec'] = data['streams'][0].get('codec_name', '').lower()
+        except Exception:
+            pass
+            
+        return info
     except Exception:
-        return None
+        return {'duration': 0.0, 'codec': None}
+
+def get_duration(input_file: Path) -> Optional[float]:
+    """Get video duration in seconds using ffprobe."""
+    # Wrapper for legacy or specific calls, but optimally we use the cached info now
+    info = get_media_info_json(input_file)
+    return info['duration'] if info['duration'] > 0 else None
 
 def get_video_codec(input_file: Path) -> Optional[str]:
     """Get video codec name using ffprobe."""
-    cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(input_file)
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-        return result.stdout.strip().lower()
-    except Exception:
-        return None
+    info = get_media_info_json(input_file)
+    return info['codec']
 
 def convert_time_to_seconds(time_str: str) -> float:
     """Convert HH:MM:SS.ms to seconds."""
@@ -688,33 +709,42 @@ class StateManager:
 # Video Processing
 # =============================================================================
 
-def calculate_total_duration(files: List[Path], console: Console) -> float:
-    """Sum up duration of all video files concurrently."""
+def scan_media_info_parallel(files: List[Path], console: Console) -> Tuple[float, Dict[Path, Dict]]:
+    """
+    Scan all files for duration and codec concurrently.
+    Returns: (total_seconds, media_cache)
+    """
     total_seconds = 0.0
+    media_cache = {}
     
-    with console.status("[bold green]Scanning files for duration (Parallel)...[/bold green]") as status:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
-            future_to_file = {executor.submit(get_duration, f): f for f in files}
+    with console.status("[bold green]Scanning files for metadata (Parallel)...[/bold green]") as status:
+        # Use more workers for IO bound probe
+        max_workers = (os.cpu_count() or 4) * 2
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_file = {executor.submit(get_media_info_json, f): f for f in files}
             
             completed_count = 0
             total_files = len(files)
             
             for future in concurrent.futures.as_completed(future_to_file):
+                f = future_to_file[future]
                 if shutdown_event.is_set():
                     executor.shutdown(wait=False, cancel_futures=True)
                     break
                 
                 completed_count += 1
-                status.update(f"[bold green]Scanning {completed_count}/{total_files}...[/bold green]")
+                if completed_count % 10 == 0:
+                    status.update(f"[bold green]Scanning {completed_count}/{total_files}...[/bold green]")
                 
                 try:
-                    d = future.result()
-                    if d:
-                        total_seconds += d
+                    info = future.result()
+                    media_cache[f] = info
+                    if info['duration']:
+                        total_seconds += info['duration']
                 except Exception:
                     pass
     
-    return total_seconds
+    return total_seconds, media_cache
 
 def process_video(
     in_file: Path,
@@ -728,7 +758,8 @@ def process_video(
     total_task_id,
     global_mode: str = "time",
     timeout: Optional[int] = None,
-    state_manager: Optional[StateManager] = None  # Added argument
+    state_manager: Optional[StateManager] = None,
+    media_cache: Optional[Dict] = None
 ):
     """Process a single video file."""
     if shutdown_event.is_set():
@@ -754,9 +785,13 @@ def process_video(
         if global_mode == "count":
             progress.advance(total_task_id, advance=1)
         elif global_mode == "time":
-             # Still can't advance time accurately without reading duration, which is slow.
-             # Ideally we could cache duration in the state file too! 
-             # For now, just skip updating total progress (it will just finish early).
+             # Try to get duration from cache to advance progress
+             cached_duration = 0
+             if media_cache and in_file in media_cache:
+                 cached_duration = media_cache[in_file].get('duration', 0)
+             
+             if cached_duration > 0:
+                 progress.advance(total_task_id, advance=cached_duration)
              pass
         
         # Check if we should delete source even if skipping
@@ -771,7 +806,13 @@ def process_video(
                 progress.console.print(f"[bold red]Cannot delete source (resume): Output {out_file.name} missing[/bold red]")
         return
 
-    if out_file.exists():
+    # Compare resolved paths to handle in-place processing correctly
+    try:
+        is_same_file = in_file.resolve() == out_file.resolve()
+    except Exception:
+        is_same_file = False
+
+    if out_file.exists() and not is_same_file:
         logger.debug(f"Skipping {in_file.name} - output exists")
         if state_manager:
             state_manager.mark_processed(rel_path_str)
@@ -799,11 +840,30 @@ def process_video(
         return
 
     # Check if video is already using an efficient codec
-    codec = get_video_codec(in_file)
+    codec = None
+    if media_cache and in_file in media_cache:
+        codec = media_cache[in_file].get('codec')
+    
+    if not codec:
+        codec = get_video_codec(in_file)
+        
     if codec in ['hevc', 'h265', 'av1']:
         progress.console.print(f"[bold blue]⊘ Skipping {in_file.name} (Already {codec.upper()} encoded)[/bold blue]")
         old_size = in_file.stat().st_size
         
+        # Use existing duration for progress
+        duration = 0
+        if media_cache and in_file in media_cache:
+            duration = media_cache[in_file].get('duration', 0)
+        if not duration:
+            duration = get_duration(in_file)
+        
+        # Update progress before skipping
+        if global_mode == "time" and duration:
+            progress.advance(total_task_id, advance=duration)
+        elif global_mode == "count":
+            progress.advance(total_task_id, advance=1)
+            
         # Use original extension if we keep the original file
         final_out_file = out_file
         if final_out_file.suffix.lower() != in_file.suffix.lower():
@@ -820,7 +880,14 @@ def process_video(
         if global_mode == "count":
             progress.advance(total_task_id, advance=1)
         elif global_mode == "time":
-            duration = get_duration(in_file)
+            # Use cached duration if available
+            duration = 0
+            if media_cache and in_file in media_cache:
+                duration = media_cache[in_file].get('duration', 0)
+            
+            if not duration:
+                duration = get_duration(in_file)
+                
             if duration:
                 progress.advance(total_task_id, advance=duration)
         
@@ -828,7 +895,13 @@ def process_video(
             state_manager.mark_processed(rel_path_str)
         return
 
-    duration = get_duration(in_file)
+    # Get duration for processing
+    duration = 0
+    if media_cache and in_file in media_cache:
+        duration = media_cache[in_file].get('duration', 0)
+    
+    if not duration:
+        duration = get_duration(in_file)
     
     # Pre-check: estimate compression ratio
     if duration and duration > 60:
@@ -1195,7 +1268,9 @@ def worker_loop(
     total_task_id,
     global_mode: str,
     timeout: Optional[int] = None,
-    state_manager: Optional[StateManager] = None # Added argument
+    state_manager: Optional[StateManager] = None,
+    media_cache: Optional[Dict] = None,
+    image_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
 ):
     """Continuous worker loop that pulls from queue."""
     # Counter to save state periodically
@@ -1213,14 +1288,37 @@ def worker_loop(
             continue
 
         if in_file.suffix.lower() in IMAGE_EXTENSIONS:
-            process_image(
-                in_file, input_path, output_path, image_quality, keep_format, 
-                delete_source, progress, total_task_id, global_mode, state_manager
-            )
+            if image_executor:
+                # Submit to image pool
+                # Note: We don't wait for result here strictly to keep main loop fast,
+                # but we need to manage queue task_done.
+                # Actually, if we submit and continue, we might flood the image pool if queue is huge.
+                # But since we pull from queue one by one, we are limited by how fast we pull.
+                # To allow proper concurrency, we should submit and go to next.
+                # BUT, we need to mark queue.task_done() only when the image task is ACTUALLY done.
+                
+                def wrapped_process_image():
+                    try:
+                        process_image(
+                            in_file, input_path, output_path, image_quality, keep_format, 
+                            delete_source, progress, total_task_id, global_mode, state_manager
+                        )
+                    finally:
+                        file_queue.task_done()
+
+                image_executor.submit(wrapped_process_image)
+                # Skip the default task_done at bottom of loop since we do it in wrapper
+                continue
+            else:
+                # Fallback to sync processing
+                process_image(
+                    in_file, input_path, output_path, image_quality, keep_format, 
+                    delete_source, progress, total_task_id, global_mode, state_manager
+                )
         else:
             process_video(
                 in_file, input_path, output_path, crf, preset, delete_source, 
-                encoder_info, progress, total_task_id, global_mode, timeout, state_manager
+                encoder_info, progress, total_task_id, global_mode, timeout, state_manager, media_cache
             )
         
         if state_manager:
@@ -1500,15 +1598,16 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
         if not quiet:
             console.print(f"[bold cyan]Resume:[/bold cyan] Tracking progress in {state_manager.state_file}")
 
-    # Calculate total duration
+    # Calculate total duration and scan media info
     global_mode = "time"
     total_duration = 0.0
+    media_cache = {}
     
     should_scan = True
     if no_scan_duration:
         should_scan = False
     elif len(files_to_process) > 100:
-        if not Confirm.ask(f"[yellow]Found {len(files_to_process)} files. Scan total duration? (May take time)[/yellow]", default=False):
+        if not Confirm.ask(f"[yellow]Found {len(files_to_process)} files. Scan metadata? (Required for fast skipping)[/yellow]", default=True):
             should_scan = False
     
     if should_scan:
@@ -1524,7 +1623,7 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
                 video_files.append(f)
 
         if video_files:
-            total_duration = calculate_total_duration(video_files, console)
+            total_duration, media_cache = scan_media_info_parallel(video_files, console)
             if not quiet:
                 console.print(f"[bold]Total Video Duration to Process: {total_duration/3600:.2f} hours[/bold]")
     else:
@@ -1565,6 +1664,11 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=total_workers)
         futures = []
         
+        image_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=os.cpu_count() or 4,
+            thread_name_prefix="ImageWorker"
+        )
+
         try:
             # Start CPU workers
             cpu_encoder = encoders[EncoderType.CPU]
@@ -1572,7 +1676,7 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
                 futures.append(executor.submit(
                     worker_loop, file_queue, input_path, output_path, crf, preset, 
                     image_quality, keep_format, delete_source, cpu_encoder, 
-                    progress, total_task_id, global_mode, timeout_val, state_manager
+                    progress, total_task_id, global_mode, timeout_val, state_manager, media_cache, image_executor
                 ))
             
             # Start hardware workers
@@ -1580,7 +1684,7 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
                 futures.append(executor.submit(
                     worker_loop, file_queue, input_path, output_path, crf, preset,
                     image_quality, keep_format, delete_source, selected_encoder,
-                    progress, total_task_id, global_mode, timeout_val, state_manager
+                    progress, total_task_id, global_mode, timeout_val, state_manager, media_cache, image_executor
                 ))
             
             # Monitoring loop
@@ -1640,6 +1744,7 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
                             shutdown_event.set()
                             pause_event.clear()
                             executor.shutdown(wait=False, cancel_futures=True)
+                            image_executor.shutdown(wait=False, cancel_futures=True)
                             # Final save
                             if state_manager:
                                 state_manager.save()
