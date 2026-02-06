@@ -739,6 +739,15 @@ def process_video(
     # Calculate relative path string for state tracking
     rel_path_str = str(in_file.relative_to(input_base_path)) if input_base_path.is_dir() else in_file.name
     
+    # Calculate target output file path
+    if input_base_path.is_dir():
+        rel_path = in_file.relative_to(input_base_path)
+        out_file = output_base_path / rel_path.with_suffix('.mp4')
+    else:
+        out_file = output_base_path
+    
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
     # Check state first if resume is enabled
     if state_manager and state_manager.is_processed(rel_path_str):
         stats.add_resumed()
@@ -749,22 +758,32 @@ def process_video(
              # Ideally we could cache duration in the state file too! 
              # For now, just skip updating total progress (it will just finish early).
              pass
+        
+        # Check if we should delete source even if skipping
+        if delete_source and in_file.exists():
+            if out_file.exists():
+                try:
+                    in_file.unlink()
+                    progress.console.print(f"[bold yellow]Deleted source (resume): {in_file.name}[/bold yellow]")
+                except Exception as e:
+                    progress.console.print(f"[bold red]Failed to delete source: {e}[/bold red]")
+            else:
+                progress.console.print(f"[bold red]Cannot delete source (resume): Output {out_file.name} missing[/bold red]")
         return
-
-    # Calculate target output file path
-    if input_base_path.is_dir():
-        rel_path = in_file.relative_to(input_base_path)
-        out_file = output_base_path / rel_path.with_suffix('.mp4')
-    else:
-        out_file = output_base_path
-    
-    out_file.parent.mkdir(parents=True, exist_ok=True)
 
     if out_file.exists():
         logger.debug(f"Skipping {in_file.name} - output exists")
         if state_manager:
             state_manager.mark_processed(rel_path_str)
         stats.add_skipped() # Count as skipped (already exists)
+        
+        # Check if we should delete source
+        if delete_source and in_file.exists():
+            try:
+                in_file.unlink()
+                progress.console.print(f"[bold yellow]Deleted source (exists): {in_file.name}[/bold yellow]")
+            except Exception as e:
+                progress.console.print(f"[bold red]Failed to delete source: {e}[/bold red]")
         return
 
     # Check if file is readable
@@ -1017,13 +1036,6 @@ def process_image(
     # Calculate relative path string for state tracking
     rel_path_str = str(in_file.relative_to(input_base_path)) if input_base_path.is_dir() else in_file.name
     
-    # Check state first if resume is enabled
-    if state_manager and state_manager.is_processed(rel_path_str):
-        stats.add_resumed()
-        if global_mode != "time":
-            progress.advance(total_task_id, advance=1)
-        return
-
     # Calculate target output file path
     if input_base_path.is_dir():
         rel_path = in_file.relative_to(input_base_path)
@@ -1036,9 +1048,36 @@ def process_image(
     
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Check state first if resume is enabled
+    if state_manager and state_manager.is_processed(rel_path_str):
+        stats.add_resumed()
+        if global_mode != "time":
+            progress.advance(total_task_id, advance=1)
+        
+        # Check if we should delete source even if skipping
+        if delete_source and in_file.exists():
+            if out_file.exists():
+                try:
+                    in_file.unlink()
+                    progress.console.print(f"[bold yellow]Deleted source (resume): {in_file.name}[/bold yellow]")
+                except Exception as e:
+                    progress.console.print(f"[bold red]Failed to delete source: {e}[/bold red]")
+            else:
+                 # Debug: print why we didn't delete
+                 pass
+        return
+
     if out_file.exists():
         if state_manager:
             state_manager.mark_processed(rel_path_str)
+        
+        # Check if we should delete source
+        if delete_source and in_file.exists():
+            try:
+                in_file.unlink()
+                progress.console.print(f"[bold yellow]Deleted source (exists): {in_file.name}[/bold yellow]")
+            except Exception as e:
+                progress.console.print(f"[bold red]Failed to delete source: {e}[/bold red]")
         return
 
     # Check if file is readable
@@ -1060,6 +1099,15 @@ def process_image(
                     save_kwargs = {'lossless': True, 'method': 6}
                 else:
                     save_kwargs = {'quality': image_quality, 'method': 6}
+                
+                # Check for animation
+                if getattr(img, "is_animated", False):
+                    save_kwargs.update({
+                        'save_all': True,
+                        'duration': img.info.get('duration', 100),
+                        'loop': 0
+                    })
+
             elif output_format in ['jpg', 'jpeg']:
                 if img.mode == 'RGBA':
                     img = img.convert('RGB')
@@ -1385,13 +1433,21 @@ def main(input_path, output_path, crf, preset, delete_source, cpu_workers, gpu_w
     
     if input_path.is_file():
         files_to_process.append(input_path)
+        # Determine appropriate extension
+        target_ext = '.mp4'
+        if input_path.suffix.lower() in IMAGE_EXTENSIONS:
+            if keep_format:
+                target_ext = input_path.suffix.lower()
+            else:
+                target_ext = '.webp'
+                
         if not output_path:
-            output_path = input_path.parent / f"{input_path.stem}_x265.mp4"
+            output_path = input_path.parent / f"{input_path.stem}_processed{target_ext}"
         else:
             output_path = Path(output_path)
             if output_path.is_dir() or (str(output_path).endswith(os.sep)):
                 output_path.mkdir(parents=True, exist_ok=True)
-                output_path = output_path / f"{input_path.stem}.mp4"
+                output_path = output_path / f"{input_path.stem}{target_ext}"
     else:
         if not output_path:
             output_path = input_path.parent / f"{input_path.name}_compressed"
